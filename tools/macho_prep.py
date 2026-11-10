@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""Prepara el ejecutable iOS (Mach-O 32 bits, MH_EXECUTE no PIE, armv6/armv7) para el loader de la PS Vita.
+
+Soporta binarios thin (0xFEEDFACE) y fat/universal (0xCAFEBABE) seleccionando el slice ARM óptimo.
+Detecta cifrado FairPlay (LC_ENCRYPTION_INFO).
+Calcula con precisión exhaustiva los punteros absolutos que requieren reubicación en memoria física (rebase.bin):
+  1. Literales en __TEXT.__text (ldr [pc, #imm]) que apuntan a __DATA, __cstring, o funciones en __text.
+  2. Punteros en __DATA (__const vtables, __mod_init_func, __objc_*, __cfstring, __data).
+  3. Stubs de imports dinámicos (__symbol_stub4).
+  4. Símbolos locales en __nl_symbol_ptr.
+Extrae el inventario completo de imports dinámicos y genera un reporte detallado.
+
+Uso: python3 -I macho_prep.py <Executable> <rebase.bin> [--report report.txt] [--arch armv7|armv6]
+"""
+import os
+import struct
+import sys
+from collections import Counter
+
+LC_SEGMENT = 0x1
+LC_SYMTAB = 0x2
+LC_DYSYMTAB = 0xB
+LC_ENCRYPTION_INFO = 0x21
+
+S_ZEROFILL = 0x1
+S_NON_LAZY = 0x6
+S_LAZY = 0x7
+
+INDIRECT_LOCAL = 0x80000000
+INDIRECT_ABS = 0x40000000
+
+N_STAB = 0xE0
+N_TYPE = 0x0E
+N_SECT = 0x0E
+N_ARM_THUMB_DEF = 0x0008
+
+CPU_TYPE_ARM = 12
+CPU_SUBTYPE_ARM_V6 = 6
+CPU_SUBTYPE_ARM_V7 = 9
+CPU_SUBTYPE_ARM_V7S = 11
+
+
+def parse(path, preferred_arch=None):
+    with open(path, 'rb') as f:
+        raw_data = bytearray(f.read())
+
+    slice_offset = 0
+    slice_size = len(raw_data)
+    detected_arch = "unknown"
+
+    # Chequear si es FAT Mach-O (big-endian 0xCAFEBABE)
+    if len(raw_data) >= 8 and raw_data[:4] in (b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'):
+        magic, nfat = struct.unpack_from('>2I', raw_data, 0)
+        archs = []
+        for i in range(nfat):
+            cputype, cpusubtype, offset, size, align = struct.unpack_from('>5I', raw_data, 8 + i * 20)
+            arch_name = "arm"
+            if cputype == CPU_TYPE_ARM:
+                if cpusubtype == CPU_SUBTYPE_ARM_V6:
+                    arch_name = "armv6"
+                elif cpusubtype == CPU_SUBTYPE_ARM_V7:
+                    arch_name = "armv7"
+                elif cpusubtype == CPU_SUBTYPE_ARM_V7S:
+                    arch_name = "armv7s"
+            archs.append((arch_name, cputype, cpusubtype, offset, size))
+
+        # Seleccionar slice
+        chosen = None
+        if preferred_arch:
+            for a in archs:
+                if a[0] == preferred_arch.lower():
+                    chosen = a
+                    break
+        if not chosen:
+            # Preferir armv7 sobre armv6
+            for a in archs:
+                if a[0] in ("armv7", "armv7s"):
+                    chosen = a
+                    break
+        if not chosen:
+            for a in archs:
+                if a[0] == "armv6":
+                    chosen = a
+                    break
+        if not chosen and archs:
+            chosen = archs[0]
+
+        if not chosen:
+            raise RuntimeError("No se encontró ningún slice ARM en el binario FAT")
+
+        slice_offset = chosen[3]
+        slice_size = chosen[4]
+        detected_arch = chosen[0]
+        d = bytearray(raw_data[slice_offset:slice_offset + slice_size])
+    else:
+        d = raw_data
+
+    magic, cpu, sub, ftype, ncmds, _sz, flags = struct.unpack_from('<7I', d, 0)
+    if magic != 0xFEEDFACE:
+        raise RuntimeError(f"Se espera Mach-O de 32 bits (magic 0xFEEDFACE), obtenido 0x{magic:08X}")
+    if ftype != 2:
+        print(f"[!] Advertencia: Mach-O ftype={ftype} (se esperaba 2 = MH_EXECUTE)")
+
+    if cpu == CPU_TYPE_ARM:
+        if sub == CPU_SUBTYPE_ARM_V6:
+            detected_arch = "armv6"
+        elif sub == CPU_SUBTYPE_ARM_V7:
+            detected_arch = "armv7"
+        elif sub == CPU_SUBTYPE_ARM_V7S:
+            detected_arch = "armv7s"
+        else:
+            detected_arch = f"arm(sub={sub})"
+
+    segs, sects, symtab, dysym = [], [], None, None
+    cryptid = 0
+    off = 28
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<2I', d, off)
+        if cmd == LC_SEGMENT:
+            name = d[off + 8:off + 24].rstrip(b'\0').decode('latin1', errors='ignore')
+            vmaddr, vmsize, fileoff, filesize, _mp, _ip, nsects, _f = struct.unpack_from('<8I', d, off + 24)
+            segs.append(dict(name=name, vmaddr=vmaddr, vmsize=vmsize, fileoff=fileoff, filesize=filesize))
+            so = off + 56
+            for _ in range(nsects):
+                sn = d[so:so + 16].rstrip(b'\0').decode('latin1', errors='ignore')
+                gn = d[so + 16:so + 32].rstrip(b'\0').decode('latin1', errors='ignore')
+                addr, ssize, soff, _al, _ro, _nr, sflags, r1, r2 = struct.unpack_from('<9I', d, so + 32)
+                sects.append(dict(seg=gn, name=sn, addr=addr, size=ssize, fileoff=soff,
+                                  type=sflags & 0xFF, flags=sflags, r1=r1))
+                so += 68
+        elif cmd == LC_SYMTAB:
+            symtab = struct.unpack_from('<4I', d, off + 8)
+        elif cmd == LC_DYSYMTAB:
+            dysym = struct.unpack_from('<18I', d, off + 8)
+        elif cmd == LC_ENCRYPTION_INFO:
+            cryptoff, cryptsize, cryptid = struct.unpack_from('<3I', d, off + 8)
+        off += size
+
+    return raw_data, d, segs, sects, symtab, dysym, detected_arch, cryptid
+
+
+def patch_vfp_vector_blocks(buf, text_sec):
+    K_VFP_NEON = {
+        0xee24ca00: 0xf3a4c940, # vmul.f32 q6, q2, d0[0]
+        0xee06ca20: 0xf3a6c160, # vmla.f32 q6, q3, d0[1]
+        0xee08ca01: 0xf3a8c141, # vmla.f32 q6, q4, d1[0]
+        0xee0aca21: 0xf3aac161, # vmla.f32 q6, q5, d1[1]
+        0xee24ea02: 0xf3a4e942, # vmul.f32 q7, q2, d2[0]
+        0xee06ea22: 0xf3a6e162, # vmla.f32 q7, q3, d2[1]
+        0xee08ea03: 0xf3a8e143, # vmla.f32 q7, q4, d3[0]
+        0xee0aea23: 0xf3aae163, # vmla.f32 q7, q5, d3[1]
+        0xee3cca0a: 0xf20ccd4a, # vadd.f32 q6, q6, q5
+    }
+    NOP = 0xe1a00000
+
+    toff = text_sec['fileoff']
+    tsize = text_sec['size']
+    nwords = tsize // 4
+
+    blocks_patched = 0
+    instrs_patched = 0
+
+    i = 3
+    while i < nwords - 4:
+        w = struct.unpack_from('<I', buf, toff + i * 4)[0]
+        if (w & 0x0fff0fff) != 0x0ee10a10:
+            i += 1
+            continue
+        w_prev = struct.unpack_from('<I', buf, toff + (i - 1) * 4)[0]
+        if (w_prev & 0x0fef0000) != 0x03800000:
+            i += 1
+            continue
+        enter_idx = i
+        exit_idx = None
+        for j in range(enter_idx + 1, min(nwords, enter_idx + 64)):
+            wj = struct.unpack_from('<I', buf, toff + j * 4)[0]
+            if (wj & 0x0fff0fff) == 0x0ee10a10:
+                exit_idx = j
+                break
+        if not exit_idx:
+            i += 1
+            continue
+        for p in range(enter_idx - 3, enter_idx + 1):
+            struct.pack_into('<I', buf, toff + p * 4, NOP)
+            instrs_patched += 1
+        exit_vmrs_idx = exit_idx - 2
+        for p in range(exit_idx - 1, max(enter_idx, exit_idx - 5), -1):
+            wp = struct.unpack_from('<I', buf, toff + p * 4)[0]
+            if wp == 0xeef10a10:
+                exit_vmrs_idx = p
+                break
+        for p in range(exit_vmrs_idx, exit_idx + 1):
+            struct.pack_into('<I', buf, toff + p * 4, NOP)
+            instrs_patched += 1
+        for p in range(enter_idx + 1, exit_vmrs_idx):
+            inst = struct.unpack_from('<I', buf, toff + p * 4)[0]
+            if inst in K_VFP_NEON:
+                struct.pack_into('<I', buf, toff + p * 4, K_VFP_NEON[inst])
+                instrs_patched += 1
+        blocks_patched += 1
+        i = exit_idx + 1
+
+    return blocks_patched, instrs_patched
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("Uso: python3 -I macho_prep.py <Executable> <rebase.bin> [--report report.txt] [--arch armv7|armv6]")
+        sys.exit(1)
+
+    src, out = sys.argv[1], sys.argv[2]
+    report = sys.argv[sys.argv.index('--report') + 1] if '--report' in sys.argv else None
+    preferred_arch = sys.argv[sys.argv.index('--arch') + 1] if '--arch' in sys.argv else None
+
+    raw_data, d, segs, sects, symtab_cmd, dysym, detected_arch, cryptid = parse(src, preferred_arch)
+
+    print(f"[*] Binario: {src}")
+    print(f"[*] Arquitectura Mach-O: {detected_arch}")
+    if cryptid != 0:
+        print(f"[!] ALERTA CRITICA: El binario esta CIFRADO por FairPlay DRM (cryptid = {cryptid})!")
+        print(f"[!] Debe ser descifrado en un dispositivo iOS (con Clutch, frida-ios-dump o bfdecrypt) antes de correr.")
+    else:
+        print(f"[+] Binario descifrado (cryptid = 0), listo para ejecución.")
+
+    lo = min(s['vmaddr'] for s in segs if s['vmsize'] and s['name'] != '__PAGEZERO')
+    hi = max(s['vmaddr'] + s['vmsize'] for s in segs if s['name'] != '__LINKEDIT')
+
+    def read32(va):
+        for s in segs:
+            if s['vmaddr'] <= va < s['vmaddr'] + s['filesize']:
+                return struct.unpack_from('<I', d, s['fileoff'] + va - s['vmaddr'])[0]
+        return 0
+
+    def sect_of(va):
+        for s in sects:
+            if s['addr'] <= va < s['addr'] + s['size']:
+                return s
+        return None
+
+    # Parse symbol table
+    names = []
+    funcs = set()
+    if symtab_cmd:
+        symoff, nsyms, stroff, _strsize = symtab_cmd
+        for i in range(nsyms):
+            strx, ntype, nsect, ndesc, value = struct.unpack_from('<IBBhI', d, symoff + i * 12)
+            idx_end = d.find(b'\0', stroff + strx)
+            name = d[stroff + strx:idx_end].decode('latin1', errors='ignore') if idx_end != -1 else ""
+            names.append(name)
+            if (ntype & N_STAB) == 0 and (ntype & N_TYPE) == N_SECT:
+                funcs.add(value & ~1)
+
+    text_sec = next((s for s in sects if s['seg'] == '__TEXT' and s['name'] == '__text'), None)
+    if not text_sec:
+        raise RuntimeError("No se encontró sección __TEXT.__text")
+
+    vfp_blocks, vfp_instrs = patch_vfp_vector_blocks(d, text_sec)
+    if vfp_blocks > 0:
+        with open(src, 'wb') as f:
+            f.write(raw_data)
+        print(f"[+] Parcheados {vfp_blocks} bloques vectoriales VFPv2 ({vfp_instrs} instrucciones) -> ARM NEON SIMD en {src}")
+
+    code_bytes = d[text_sec['fileoff']:text_sec['fileoff'] + text_sec['size']]
+
+    # Function prologues and call targets in __text
+    for i in range(0, len(code_bytes) - 3, 4):
+        va = text_sec['addr'] + i
+        w = struct.unpack_from('<I', code_bytes, i)[0]
+        # push {..., lr} or str lr, [sp, #-4]!
+        if (w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004:
+            funcs.add(va)
+        # bl target
+        elif (w & 0x0F000000) == 0x0B000000:
+            imm24 = w & 0x00FFFFFF
+            if imm24 & 0x00800000:
+                imm24 -= 0x01000000
+            target = va + 8 + (imm24 << 2)
+            if text_sec['addr'] <= target < text_sec['addr'] + text_sec['size']:
+                funcs.add(target)
+        # first instruction after clang's mov r0, r0 alignment padding (HOS2 0x21aa90: called only
+        # through a pointer, no push/bl, so nothing else marks it and its literals were left unrebased)
+        elif i >= 4 and w != 0xE1A00000 and struct.unpack_from('<I', code_bytes, i - 4)[0] == 0xE1A00000:
+            funcs.add(va)
+        # bx lr leaf function
+        if (w & 0x0FFFFFFF) == 0x012FFF1E:
+            funcs.add(va)
+            if i >= 4:
+                prev = struct.unpack_from('<I', code_bytes, i - 4)[0]
+                if i >= 8:
+                    prev2 = struct.unpack_from('<I', code_bytes, i - 8)[0]
+                    if (prev2 & 0xFFFF0000) in (0xE8BD0000, 0xE12F0000) or prev2 in (0xE1A00000, 0):
+                        funcs.add(va - 4)
+
+    # Initializer functions in __mod_init_func
+    mod_sec = next((s for s in sects if s['name'] == '__mod_init_func'), None)
+    if mod_sec:
+        for a in range(mod_sec['addr'], mod_sec['addr'] + mod_sec['size'], 4):
+            funcs.add(read32(a))
+
+    # C++ vtables in __DATA.__const
+    data_const_sec = next((s for s in sects if s['seg'] == '__DATA' and s['name'] == '__const'), None)
+    if data_const_sec:
+        for a in range(data_const_sec['addr'], data_const_sec['addr'] + data_const_sec['size'], 4):
+            w = read32(a)
+            if text_sec['addr'] <= w < text_sec['addr'] + text_sec['size'] and (w & 3) == 0:
+                funcs.add(w)
+
+    # Detect all PC-relative offset targets (PIC loads where register is later added to PC)
+    # These contain relative offsets that must NEVER be rebased
+    pc_rel_targets = set()
+    for i in range(0, len(code_bytes) - 3, 4):
+        va = text_sec['addr'] + i
+        w = struct.unpack_from('<I', code_bytes, i)[0]
+        if (w & 0x0E5F0000) == 0x041F0000:
+            rd = (w >> 12) & 0xF
+            u = (w >> 23) & 1
+            imm12 = w & 0xFFF
+            tva = (va + 8 + imm12) if u else (va + 8 - imm12)
+            cur_reg = rd
+            for j in range(4, min(256, len(code_bytes) - i), 4):
+                nw = struct.unpack_from('<I', code_bytes, i + j)[0]
+                # Track register copy: mov cur_reg, new_reg
+                if (nw & 0x0FE0000F) == (0x01A00000 | cur_reg):
+                    cur_reg = (nw >> 12) & 0xF
+                # ADD reg, pc, cur_reg (or ADD reg, cur_reg, pc). Register form only: an immediate's low
+                # nibble is not rm (HOS2 0x205060 add r9, r2, #0xff hid the __nl_symbol_ptr literal 0x204b90).
+                if (nw & 0x0FE00010) in (0x00800000, 0x00400000): # ADD/SUB
+                    rn = (nw >> 16) & 0xF
+                    rm = nw & 0xF
+                    if (rn == 15 and rm == cur_reg) or (rn == cur_reg and rm == 15):
+                        pc_rel_targets.add(tva)
+                        break
+                # LDR reg, [pc, +/-cur_reg], unshifted and not into pc: ldrls pc, [pc, r3, lsl #2] is a switch
+                # jump (HOS2 0x223e98), which hid the __nl_symbol_ptr literal 0x2246a8.
+                if (nw & 0x0F200FF0) == 0x07000000 and (nw >> 12) & 0xF != 15:
+                    rn = (nw >> 16) & 0xF
+                    rm = nw & 0xF
+                    if rn == 15 and rm == cur_reg:
+                        pc_rel_targets.add(tva)
+                        break
+                # Function return or unconditional branch ends basic block
+                if (nw & 0x0FFFFFFF) == 0x012FFF1E or (nw & 0x0FE00000) == 0x08A00000:
+                    break
+
+    # Allocator call targets: malloc/calloc/realloc stubs plus thin wrappers that call them
+    # within their first instructions (e.g. HOS2 0x18d7c0 = calloc(n, 1) + memset).
+    alloc_targets = set()
+    stub_sec = next((s for s in sects if s['type'] == 8), None)  # S_SYMBOL_STUBS
+    if stub_sec and dysym:
+        for k in range(stub_sec['size'] // 12):
+            idx = struct.unpack_from('<I', d, dysym[12] + (stub_sec['r1'] + k) * 4)[0]
+            if idx < len(names) and names[idx] in ('_malloc', '_calloc', '_realloc'):
+                alloc_targets.add(stub_sec['addr'] + k * 12)
+
+    def bl_target(va, w):
+        imm24 = w & 0x00FFFFFF
+        if imm24 & 0x00800000:
+            imm24 -= 0x01000000
+        return va + 8 + (imm24 << 2)
+
+    for f in list(funcs):
+        for k in range(6):
+            fi = f + k * 4 - text_sec['addr']
+            if not 0 <= fi < len(code_bytes) - 3:
+                break
+            fw = struct.unpack_from('<I', code_bytes, fi)[0]
+            if (fw & 0x0F000000) == 0x0B000000 and bl_target(f + k * 4, fw) in alloc_targets:
+                alloc_targets.add(f)
+                break
+
+    # Literal pools also hold plain numbers that happen to equal a function address in low
+    # __text (HOS2: 40000 = 0x9c40 is both a calloc size and a function start). Follow the
+    # loaded register to its first use: arithmetic or an allocator size argument means
+    # the slot is a number, never a pointer.
+    def literal_is_number(i, rd):
+        regs = {rd}
+        for k in range(1, 24):
+            j = i + k * 4
+            if j > len(code_bytes) - 4:
+                return False
+            va = text_sec['addr'] + j
+            w = struct.unpack_from('<I', code_bytes, j)[0]
+            cond = w >> 28
+            if cond == 0xF:
+                return False
+            if (w & 0x0E000000) == 0x0A000000:  # b / bl
+                if w & 0x01000000:
+                    if regs & {0, 1, 2, 3}:
+                        return bl_target(va, w) in alloc_targets and bool(regs & {0, 1})
+                    continue
+                if cond == 0xE:
+                    return False
+                continue
+            if (w & 0x0FFFFFD0) == 0x012FFF10:  # bx / blx reg
+                return False
+            if (w & 0x0FC000F0) == 0x00000090 or (w & 0x0F8000F0) == 0x00800090:  # mul/mla/umull...
+                if {w & 0xF, (w >> 8) & 0xF} & regs:
+                    return True
+                continue
+            if (w & 0x0E000090) == 0x00000090 or (w & 0x0C000000) == 0x04000000:  # load/store
+                rn, rt = (w >> 16) & 0xF, (w >> 12) & 0xF
+                if rn in regs or (not (w & 0x00100000) and rt in regs):
+                    return False  # used as address, or stored to memory: keep pointer semantics
+                regs.discard(rt)
+                if not regs:
+                    return False
+                continue
+            if (w & 0x0C000000) == 0:  # data processing
+                op, imm = (w >> 21) & 0xF, (w >> 25) & 1
+                rn, dst = (w >> 16) & 0xF, (w >> 12) & 0xF
+                srcs = set() if op in (13, 15) else {rn}
+                if not imm:
+                    srcs.add(w & 0xF)
+                    if w & 0x10:
+                        srcs.add((w >> 8) & 0xF)
+                if srcs & regs:
+                    if op == 13 and not imm and (w & 0xFF0) == 0:  # mov rX, rD: follow the copy
+                        regs.add(dst)
+                        continue
+                    # cmp/cmn/tst/teq prove nothing: HOS2 0x2238b4 compares a callback against &func
+                    return op not in (8, 9, 10, 11)
+                if op not in (8, 9, 10, 11):  # tst/teq/cmp/cmn write nothing
+                    regs.discard(dst)
+                if not regs:
+                    return False
+                continue
+        return False
+
+    numeric_slots = set()
+    for i in range(0, len(code_bytes) - 3, 4):
+        w = struct.unpack_from('<I', code_bytes, i)[0]
+        if (w & 0x0E5F0000) == 0x041F0000 and (w & 0x00100000):
+            va = text_sec['addr'] + i
+            tva = va + 8 + (w & 0xFFF) if (w >> 23) & 1 else va + 8 - (w & 0xFFF)
+            if literal_is_number(i, (w >> 12) & 0xF):
+                numeric_slots.add(tva)
+
+    rebase = set()
+    stats = Counter()
+    imports = Counter()
+    handled_by_dynlink = set()
+
+    # Track dynamic imports from LC_DYSYMTAB
+    if dysym:
+        indirectsymoff = dysym[12]
+        extreloff, nextrel = dysym[14], dysym[15]
+        for s in sects:
+            if s['type'] in (S_NON_LAZY, S_LAZY):
+                for i in range(s['size'] // 4):
+                    idx = struct.unpack_from('<I', d, indirectsymoff + (s['r1'] + i) * 4)[0]
+                    slot = s['addr'] + i * 4
+                    if idx & INDIRECT_LOCAL:
+                        rebase.add(slot)
+                        stats[(s['name'], 'local')] += 1
+                    elif not (idx & INDIRECT_ABS):
+                        handled_by_dynlink.add(slot)
+                        if idx < len(names):
+                            imports[names[idx]] += 1
+        for i in range(nextrel):
+            addr, info = struct.unpack_from('<iI', d, extreloff + i * 8)
+            handled_by_dynlink.add(addr)
+            symnum = info & 0xFFFFFF
+            if symnum < len(names):
+                imports[names[symnum]] += 1
+
+    # 1. Relocate literal pools in __TEXT.__text
+    skipped_num = []
+    for i in range(0, len(code_bytes) - 3, 4):
+        va = text_sec['addr'] + i
+        w = struct.unpack_from('<I', code_bytes, i)[0]
+        # ARM ldr rD, [pc, #+/-imm12]
+        if (w & 0x0E5F0000) == 0x041F0000:
+            u = (w >> 23) & 1
+            imm12 = w & 0xFFF
+            tva = (va + 8 + imm12) if u else (va + 8 - imm12)
+            if not (text_sec['addr'] <= tva < text_sec['addr'] + text_sec['size'] - 3):
+                continue
+            if tva in pc_rel_targets:
+                continue
+            val = read32(tva)
+            s = sect_of(val)
+            if not s:
+                continue
+            if s['seg'] == '__DATA':
+                rebase.add(tva)
+                stats[('__text_lit', s['name'])] += 1
+            elif s['seg'] == '__TEXT':
+                if s['name'] in ('__cstring', '__ustring'):
+                    rebase.add(tva)
+                    stats[('__text_lit', s['name'])] += 1
+                elif s['name'] == '__text':
+                    if tva in numeric_slots and val in funcs:
+                        stats[('__text_lit', 'func_skip_num')] += 1
+                        skipped_num.append((tva, val))
+                    elif (val & 3) == 0 and val in funcs:
+                        rebase.add(tva)
+                        stats[('__text_lit', 'func')] += 1
+                elif s['name'] in ('__const', '__gcc_except_tab'):
+                    # __TEXT,__const also holds halfword tables: BIA Level::InitAnimTextures loads
+                    # TTextureParam* 0x1659f6 (2-byte aligned); skipping it crashed AddAnimTexture (hosttest).
+                    if (val & 3) == 0 or (s['name'] == '__const' and (val & 1) == 0):
+                        rebase.add(tva)
+                        stats[('__text_lit', s['name'])] += 1
+
+    # 1b. Relocate switch jump tables in __TEXT.__text
+    # Pattern: ldr pc, [pc, rm, lsl #2] where the table starts at (va + 8)
+    for i in range(0, len(code_bytes) - 3, 4):
+        va = text_sec['addr'] + i
+        w = struct.unpack_from('<I', code_bytes, i)[0]
+        if (w & 0x0FFFFFF0) == 0x079FF100:
+            table_start = va + 8
+            cmp_limit = None
+            for back in range(4, 28, 4):
+                prev_pc = va - back
+                prev_idx = prev_pc - text_sec['addr']
+                if prev_idx < 0:
+                    break
+                prev = struct.unpack_from('<I', code_bytes, prev_idx)[0]
+                # cmp rn, rm: the bound is a register (BIA Level::RunScript 0xc6464 cmp r3, r2 with r2 = literal
+                # 0x1fa). Read as an immediate it gave 3 entries; case 11 (0xc6e58) jumped unslid (run 3 crash).
+                if (prev & 0x0FF00010) == 0x01500000:
+                    rm = prev & 0xF
+                    for back2 in range(4, 64, 4):
+                        li = prev_idx - back2
+                        if li < 0:
+                            break
+                        lw = struct.unpack_from('<I', code_bytes, li)[0]
+                        if (lw & 0x0F7F0000) == 0x051F0000 and (lw >> 12) & 0xF == rm:  # ldr rm, [pc, #+/-imm]
+                            lva = text_sec['addr'] + li
+                            cmp_limit = read32(lva + 8 + (lw & 0xFFF) if lw & 0x00800000 else lva + 8 - (lw & 0xFFF)) + 1
+                            break
+                    break
+                if (prev & 0x0FF00000) == 0x03500000:  # cmp rn, #imm
+                    rot = (prev >> 8) & 0xF
+                    val = prev & 0xFF
+                    if rot > 0:
+                        val = ((val >> (rot * 2)) | (val << (32 - rot * 2))) & 0xFFFFFFFF
+                    cmp_limit = val + 1
+                    break
+                if (prev & 0x0DF00000) == 0x01A00000 and (prev & 0x000F0000) == 0:
+                    rot = (prev >> 8) & 0xF
+                    val = prev & 0xFF
+                    if rot > 0:
+                        val = ((val >> (rot * 2)) | (val << (32 - rot * 2))) & 0xFFFFFFFF
+                    if cmp_limit is None and val < 256:
+                        cmp_limit = val + 1
+
+            limit = cmp_limit if (cmp_limit is not None and cmp_limit <= 512) else 512
+            for idx in range(limit):
+                ea = table_start + idx * 4
+                e_off = ea - text_sec['addr']
+                if e_off + 4 > len(code_bytes):
+                    break
+                dest = struct.unpack_from('<I', code_bytes, e_off)[0]
+                if text_sec['addr'] <= dest < text_sec['addr'] + text_sec['size'] and (dest & 3) == 0:
+                    rebase.add(ea)
+                    stats[('__text_jumptable', 'entry')] += 1
+                else:
+                    break
+
+    # 2. Relocate __symbol_stub4 targets
+    stubs = next((s for s in sects if s['name'] == '__symbol_stub4'), None)
+    if stubs:
+        for a in range(stubs['addr'] + 8, stubs['addr'] + stubs['size'], 12):
+            if read32(a - 8) == 0xE59FC000 and lo <= read32(a) < hi:
+                rebase.add(a)
+                stats[('__symbol_stub4', 'la_ptr')] += 1
+
+    # 3. Relocate __DATA sections
+    for s in sects:
+        if s['seg'] != '__DATA':
+            continue
+        if s['type'] == S_ZEROFILL:
+            continue
+        if s['name'] == '__mod_init_func':
+            for a in range(s['addr'], s['addr'] + s['size'], 4):
+                v = read32(a)
+                if lo <= v < hi:
+                    rebase.add(a)
+                    stats[(s['name'], 'init_fn')] += 1
+        elif s['name'] in ('__objc_classlist', '__objc_protolist', '__objc_classrefs', '__objc_superrefs', '__objc_selrefs'):
+            for a in range(s['addr'], s['addr'] + s['size'], 4):
+                v = read32(a)
+                if lo <= v < hi:
+                    rebase.add(a)
+                    stats[(s['name'], 'ptr')] += 1
+        elif s['name'] in ('__objc_const', '__objc_data', '__const', '__data', '__cfstring'):
+            for a in range(s['addr'], s['addr'] + s['size'], 4):
+                v = read32(a)
+                if not (lo <= v < hi):
+                    continue
+                ts = sect_of(v)
+                if not ts:
+                    continue
+                if ts['name'] == '__text' and (v & 3) != 0:
+                    continue
+                # BIA 0x170908 (fixed-point 1.0 = m[15] of a GL matrix) and 0x1709d4 (u16 index table 0,1,..):
+                # 0x00010000 "points into __text"; rebased, w = -26623 clipped every vertex (black screen, run 2).
+                # Run 7: __map_char (u16 ASCII->module, 0x50004 = 4,5) and _g_meshAlphaAnim* (fixed point 0x5000,
+                # 0xc800) also "point into __text"; the slid digit modules looped Sprite::PaintFModule (stack
+                # overflow on grenade pickup). Data only holds __text pointers to whole functions.
+                if ts['name'] == '__text' and (v & ~1) not in funcs:
+                    continue
+                if (v >> 16) == (v & 0xFFFF) + 1:  # u16 pair n, n+1 (rest of __map_char: 0x170016 -> __DATA)
+                    continue
+                rebase.add(a)
+                stats[(s['name'], 'ptr')] += 1
+
+    # Remove any slots handled at runtime by external dynamic relocations
+    for slot in handled_by_dynlink:
+        if slot in rebase:
+            rebase.remove(slot)
+
+    rebase_sorted = sorted(list(rebase))
+
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or '.', exist_ok=True)
+    with open(out, 'wb') as f:
+        f.write(struct.pack('<4sI', b'RBS1', len(rebase_sorted)))
+        f.write(struct.pack(f'<{len(rebase_sorted)}I', *rebase_sorted))
+
+    lines = [
+        f'Binario: {src} ({detected_arch})',
+        f'FairPlay cryptid: {cryptid} ({"CIFRADO" if cryptid else "descifrado"})',
+        f'Rango imagen: {lo:#x}-{hi:#x}',
+        f'Funciones identificadas en __text: {len(funcs)}',
+        f'Rebase: {len(rebase_sorted)} palabras -> {out}',
+    ]
+    lines += [f'  {sn:22} {k:15}: {n}' for (sn, k), n in sorted(stats.items())]
+    lines += [f'Literales numéricos que coinciden con una función (no reubicados): {len(set(skipped_num))}']
+    lines += [f'  slot {a:#08x} = {v:#x} ({v})' for a, v in sorted(set(skipped_num))]
+    lines += [f'Imports dinámicos únicos: {len(imports)}']
+    lines += [f'  {n}' for n in sorted(imports)]
+
+    print('\n'.join(lines[:len(stats) + 5]))
+    if report:
+        os.makedirs(os.path.dirname(os.path.abspath(report)) or '.', exist_ok=True)
+        with open(report, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f"[+] Reporte completo guardado en {report}")
+
+
+if __name__ == '__main__':
+    main()
