@@ -13,3 +13,4 @@
 #define BUNDLE_PATH DATA_PATH "game_app/"
 #define DOCS_PATH   DATA_PATH "saves/"
 #define LOGS_PATH   DATA_PATH "logs/"
+#define PORT_STRETCH 1 // options.c default: full screen (as before the options menu)

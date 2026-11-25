@@ -22,3 +22,7 @@ uint32_t gles_get_draw_calls(void);
 
 /** @brief Re-sends the guest's vertex/texcoord pointers to vitaGL (after a cutscene). */
 void gles_reapply_arrays(void);
+
+/** @brief Screen rectangle the game image is drawn to (full screen or original aspect, options menu). */
+void gles_dest_rect(int *x, int *y, int *w, int *h);
+extern int gles_rot180; /**< 1 when the last frame was drawn for CTouchPad orientation 2. */

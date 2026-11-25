@@ -19,10 +19,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gles.h"
 #include "hle.h"
 #include "input.h"
 #include "log.h"
 #include "macho.h"
+#include "options.h"
 
 #define GAME_W 480
 #define GAME_H 320
@@ -162,6 +164,69 @@ static void load_controls(void) {
     l_info("[INPUT] %s: %d entries (deadzone %d)", CONTROLS_PATH, n, cfg.deadzone);
 }
 
+// ---------------------------------------------------------------- options.c: button editor and hidden HUD
+// One menu row per distinct tap point of the table (an "action"); its buttons are the ones tapping there.
+static struct {
+    int x, y;
+    char label[32];
+} acts[NBUTTONS];
+static int nacts;
+
+static void build_actions(void) {
+    static const struct {
+        int x, y;
+        const char *label;
+    } known[] = {{413, 261, "Fire (right stick)"}, {453, 27, "Top-right button"}, {174, 16, "Top bar button"}};
+    nacts = 0;
+    for (int i = 0; i < NBUTTONS; i++) {
+        int k = 0;
+        while (k < nacts && (acts[k].x != buttons[i].x || acts[k].y != buttons[i].y))
+            k++;
+        if (buttons[i].x < 0 || k < nacts)
+            continue;
+        acts[nacts].x = buttons[i].x, acts[nacts].y = buttons[i].y;
+        snprintf(acts[nacts].label, sizeof(acts[nacts].label), "HUD button %d,%d", buttons[i].x, buttons[i].y);
+        for (unsigned j = 0; j < sizeof(known) / sizeof(known[0]); j++)
+            if (known[j].x == buttons[i].x && known[j].y == buttons[i].y)
+                snprintf(acts[nacts].label, sizeof(acts[nacts].label), "%s", known[j].label);
+        nacts++;
+    }
+}
+
+int input_bind_count(void) { return nacts; }
+const char *input_bind_label(int i) { return acts[i].label; }
+uint32_t input_bind_mask(int i) {
+    uint32_t m = 0;
+    for (int b = 0; b < NBUTTONS; b++)
+        if (buttons[b].x == acts[i].x && buttons[b].y == acts[i].y)
+            m |= buttons[b].mask;
+    return m;
+}
+void input_bind_set(int i, uint32_t mask) { // unmapped D-pad directions drive the left stick again
+    for (int b = 0; b < NBUTTONS; b++)
+        if (mask & buttons[b].mask)
+            buttons[b].x = acts[i].x, buttons[b].y = acts[i].y;
+        else if (buttons[b].x == acts[i].x && buttons[b].y == acts[i].y)
+            buttons[b].x = buttons[b].y = -1;
+}
+void input_save_controls(void) {
+    write_default_controls(); // writes the table as it is now
+    l_info("[INPUT] %s saved from the options menu", CONTROLS_PATH);
+}
+
+// Tap points + move stick (landscape 480x320) -> the portrait FBO, normalized (see uv4/uv2 in gles.c).
+int input_hud_points(float (*pts)[4], int max) {
+    int n = 0;
+    for (int i = 0; i <= nacts && n < max; i++, n++) {
+        float sx = (i < nacts ? acts[i].x : cfg.lx) / (float)GAME_W, sy = (i < nacts ? acts[i].y : cfg.ly) / (float)GAME_H;
+        pts[n][0] = gles_rot180 ? sy : 1 - sy;
+        pts[n][1] = gles_rot180 ? 1 - sx : sx;
+        // move stick: zone ±1.6 radii (axes swap with the portrait FBO); HUD buttons: point rule
+        pts[n][2] = i < nacts ? 0 : 1.6f * cfg.lr / GAME_H, pts[n][3] = i < nacts ? 0 : 1.6f * cfg.lr / GAME_W;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------- init / poll
 
 void input_init(void) {
@@ -169,6 +234,7 @@ void input_init(void) {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
     sceMotionStartSampling();
     load_controls();
+    build_actions();
 }
 
 void input_bind(void) {
@@ -194,14 +260,19 @@ void input_poll(void) {
         tilt_poll(*(uint32_t *)pad_ptr);
     SceCtrlData pad;
     sceCtrlPeekBufferPositive(0, &pad, 1);
+    options_poll(pad.buttons); // SELECT+START: options menu; L+R: on-screen controls
+    pad.buttons = options_filter_buttons(pad.buttons); // L/R held back briefly: L+R must not reach the game
     SceTouchData t;
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1) < 1)
         t.reportNum = 0;
 
-    // Front touch: the 480x320 image is stretched over the whole screen (1920x1088 touch units, gles.c).
+    // Front touch (1920x1088 units) -> the screen rectangle of the 480x320 image (full screen or aspect, gles.c).
+    int dx, dy, dw, dh;
+    gles_dest_rect(&dx, &dy, &dw, &dh);
     for (int i = 0; i < 2; i++) {
         int down = i < (int)t.reportNum;
-        slot_set(SLOT_FINGER0 + i, down, down ? t.report[i].x * GAME_W / 1920 : 0, down ? t.report[i].y * GAME_H / 1088 : 0);
+        slot_set(SLOT_FINGER0 + i, down, down ? (t.report[i].x / 2 - dx) * GAME_W / dw : 0,
+                 down ? (t.report[i].y / 2 - dy) * GAME_H / dh : 0);
     }
 
     // Left stick (+ unmapped D-pad) -> drag inside the move joystick.

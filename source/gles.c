@@ -18,6 +18,7 @@
 #include "hle.h"
 #include "imports.h"
 #include "log.h"
+#include "options.h"
 #include "objc.h"
 #include "macho.h"
 
@@ -25,11 +26,8 @@
 #define FB_H 480
 #define SCR_W 960
 #define SCR_H 544
-// Fullscreen (as in Hero of Sparta II): the 480x320 game image is stretched to the whole 960x544
-// screen (x2 horizontally, x1.7 vertically). input.c maps touches with the same stretch.
-#define DST_H SCR_H
-#define DST_W SCR_W
-#define DST_X 0
+// Full screen stretch (as in Hero of Sparta II) or original aspect (816x544 centered): options menu (options.c),
+// gles_dest_rect; input.c maps touches through the same rectangle.
 
 #define GL_FRAMEBUFFER_COMPLETE_OES 0x8CD5
 #define GL_RENDERBUFFER_WIDTH_OES 0x8D42
@@ -96,9 +94,24 @@ uint32_t gles_get_draw_calls(void) {
     return gles_draw_calls;
 }
 
+// On-screen controls hidden with L+R (options.c decides from the draw's rectangle on screen). Client arrays only:
+// with a buffer object bound (3D meshes) the data is not mirrored here.
+static int hud_filter(GLenum mode, const void *idx, GLenum itype, int first, int count, const uint16_t **out) {
+    if (!opt_hud_hidden || !vtx.size)
+        return -1;
+    GLint ab = 0, eb = 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &ab);
+    if (idx)
+        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eb);
+    return options_hud_filter(mode, ab || eb ? NULL : vtx.ptr, vtx.type, vtx.size, vtx.stride, idx, itype, first,
+                              count, out); // NULL: solo cuenta si el frame tiene 3D
+}
+
 static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     gles_draw_calls++;
-    glDrawArrays(mode, first, count);
+    const uint16_t *hud_i;
+    int hud_n = hud_filter(mode, NULL, 0, first, count, &hud_i);
+    (hud_n > 0 ? options_hud_draw(hud_i, hud_n) : hud_n == 0 ? (options_hud_mask(1), glDrawArrays(mode, first, count), options_hud_mask(0)) : glDrawArrays(mode, first, count));
 }
 
 static void g_glGetPointerv(GLenum pname, void **out) {
@@ -168,8 +181,9 @@ void gles_init(void) {
     vglUseTripleBuffering(GL_FALSE);
     // vitaGL takes every pool but these thresholds. sceVideodecInitLibrary needs PHYCONT pages: vglInitExtended
     // leaves none -> 0x80024302 NO_FREE_PHYSICAL_PAGE (runs 1-2, even with 32 MB RAM free). As Hero of Sparta II.
+    options_load(); // MSAA is fixed here (vitaGL applies it to the screen and every FBO)
     vglInitWithCustomThreshold(0, SCR_W, SCR_H, 16 * 1024 * 1024, 0, 16 * 1024 * 1024,
-                               0x8C6000 /* vitaGL default cdlg threshold */, SCE_GXM_MULTISAMPLE_NONE);
+                               0x8C6000 /* vitaGL default cdlg threshold */, options_msaa_mode());
     glGenTextures(1, &fbo_tex);
     glBindTexture(GL_TEXTURE_2D, fbo_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FB_W, FB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -192,8 +206,78 @@ void gles_init(void) {
     // clearing depth (hosttest: an uninitialised depth buffer hid every quad -> black screen).
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE); // RGB565 semantics, see g_glColorMask
-    l_info("vitaGL: FBO %ux%u -> screen %ux%u at x=%d", FB_W, FB_H, DST_W, DST_H, DST_X);
+    l_info("vitaGL: FBO %ux%u -> screen %ux%u", FB_W, FB_H, SCR_W, SCR_H);
 }
+
+// Destination rectangle on screen (input.c maps touches back through it): full screen or 480x320 aspect.
+void gles_dest_rect(int *x, int *y, int *w, int *h) {
+    int dw = opt_stretch ? SCR_W : SCR_H * FB_H / FB_W; // the FBO is seen rotated: FB_H wide
+    *x = (SCR_W - dw) / 2, *y = 0, *w = dw, *h = SCR_H;
+}
+
+// ---------------------------------------------------------------- scaling to the screen (options.c filter)
+// sharp bilinear: the FBO is enlarged x k with nearest (k = integer factor >= scale) into an intermediate
+// FBO, then reduced with bilinear to the screen: crisp pixels without uneven steps.
+int gles_rot180; // CTouchPad orientation 2 in the last gles_present (input.c maps HUD points with it)
+static GLuint pre_fbo, pre_tex;
+static int pre_w, pre_h;
+static GLint scr_filter = GL_LINEAR;
+
+static void set_filter(GLuint t, GLint f) {
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+}
+
+// Draws the game's FBO on the screen (fixed-function state already prepared by gles_present).
+static void draw_screen(void) {
+    int dx, dy, dw, dh;
+    gles_dest_rect(&dx, &dy, &dw, &dh);
+    int k = opt_filter == FILTER_SHARP ? (dh + FB_W - 1) / FB_W : 1; // seen height = FB_W
+    GLuint src = fbo_tex;
+    GLint want = opt_filter == FILTER_PIXEL || k > 1 ? GL_NEAREST : GL_LINEAR;
+    if (want != scr_filter)
+        set_filter(fbo_tex, want), scr_filter = want;
+    static const float unit[] = {0, 0, 1, 0, 0, 1, 1, 1};
+    if (k > 1) {
+        if (!pre_tex) {
+            pre_w = FB_W * k, pre_h = FB_H * k;
+            glGenTextures(1, &pre_tex), glGenFramebuffers(1, &pre_fbo);
+            glBindTexture(GL_TEXTURE_2D, pre_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pre_w, pre_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            set_filter(pre_tex, GL_LINEAR);
+            glBindFramebuffer(GL_FRAMEBUFFER, pre_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, pre_tex, 0);
+            l_info("[GL] sharp bilinear: %dx%d x%d", FB_W, FB_H, k);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, pre_fbo);
+        glViewport(0, 0, pre_w, pre_h);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrthof(0, 1, 0, 1, -1, 1); // same orientation as fbo_tex: the rotation UVs below still apply
+        glBindTexture(GL_TEXTURE_2D, fbo_tex);
+        glVertexPointer(2, GL_FLOAT, 0, unit);
+        glTexCoordPointer(2, GL_FLOAT, 0, unit);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glLoadIdentity();
+        glOrthof(0, SCR_W, SCR_H, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, SCR_W, SCR_H);
+        src = pre_tex;
+    }
+    glClearColor(0, 0, 0, 1); // side bars: black, not the game's clear color
+    glClear(GL_COLOR_BUFFER_BIT);
+    // Screen corners -> vertical FBO texture: orientation 4 = top edge of the FBO on the left edge of the
+    // screen, 2 = rotated 180 (see gles_present).
+    static const float uv4[] = {1, 1, 1, 0, 0, 1, 0, 0}, uv2[] = {0, 0, 0, 1, 1, 0, 1, 1};
+    const float xy[] = {dx, dy, dx + dw, dy, dx, dy + dh, dx + dw, dy + dh};
+    glBindTexture(GL_TEXTURE_2D, src);
+    glVertexPointer(2, GL_FLOAT, 0, xy);
+    glTexCoordPointer(2, GL_FLOAT, 0, gles_rot180 ? uv2 : uv4);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+}
+
 
 // Blits the 320x480 FBO to the screen. Every fixed-function state that could alter the blit (fog,
 // lighting, culling, stencil, a second texture unit, the texture matrix, write masks) is saved,
@@ -253,8 +337,6 @@ void gles_present(void) {
     glMatrixMode(GL_MODELVIEW);
     glPushMatrix();
     glLoadIdentity();
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
     // Screen corners (top-left, top-right, bottom-left, bottom-right) -> vertical FBO texture.
     // The game rotates its own rendering by CTouchPad::s_currentDeviceOrientation (initial value 4 in
     // __DATA; TransformCoordinatesByOrientation: 4 -> x'=y, y'=320-x, 2 -> the same turned 180 degrees),
@@ -263,11 +345,10 @@ void gles_present(void) {
     static const int *orient;
     if (!orient)
         orient = (const int *)macho_sym("__ZN9CTouchPad26s_currentDeviceOrientationE");
-    static const float uv4[] = {1, 1, 1, 0, 0, 1, 0, 0}, uv2[] = {0, 0, 0, 1, 1, 0, 1, 1};
-    const float xy[] = {DST_X, 0, DST_X + DST_W, 0, DST_X, SCR_H, DST_X + DST_W, SCR_H};
-    glVertexPointer(2, GL_FLOAT, 0, xy);
-    glTexCoordPointer(2, GL_FLOAT, 0, orient && *orient == 2 ? uv2 : uv4);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    gles_rot180 = orient && *orient == 2;
+    draw_screen();
+    if (options_pending())
+        options_run(draw_screen);
     static int presented;
     static uint32_t last_draws;
     static uint64_t t_win;
@@ -284,6 +365,7 @@ void gles_present(void) {
                    (gles_draw_calls - last_draws) / 300, px[0], px[1], px[2]);
         t_win = now, last_draws = gles_draw_calls;
     }
+    options_frame();
     vglSwapBuffers(ime_active()); // GL_TRUE while system dialog is active
 
     // Restore guest OpenGL state.
@@ -343,7 +425,9 @@ static void g_glTexEnvx(GLenum target, GLenum pname, GLfixed param) {
 
 static void g_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {
     gles_draw_calls++;
-    glDrawElements(mode, count, type, indices);
+    const uint16_t *hud_i;
+    int hud_n = hud_filter(mode, indices, type, 0, count, &hud_i);
+    (hud_n > 0 ? options_hud_draw(hud_i, hud_n) : hud_n == 0 ? (options_hud_mask(1), glDrawElements(mode, count, type, indices), options_hud_mask(0)) : glDrawElements(mode, count, type, indices));
 }
 
 // glFogx: GL_FOG_MODE takes an enum, the other fog parameters are 16.16 fixed point.

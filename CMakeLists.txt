@@ -88,6 +88,8 @@ add_executable(${CMAKE_PROJECT_NAME}
   source/darwin_printf.c
   source/objc.c
   source/gles.c
+  source/options.c
+  source/font8x8.c
   source/vitagl_no_splash.c
   source/coreaudio.c
   source/input.c
